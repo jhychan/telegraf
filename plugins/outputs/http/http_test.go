@@ -49,6 +49,34 @@ func getMetrics(n int) []telegraf.Metric {
 	return m
 }
 
+func getTagMetric(t string) telegraf.Metric {
+	m := metric.New(
+		"cpu",
+		map[string]string{
+			"tag": t,
+		},
+		map[string]interface{}{
+			"value": 42.0,
+		},
+		time.Unix(0, 0),
+	)
+
+	return m
+}
+
+func getTagMetrics(n int) []telegraf.Metric {
+	a := make([]telegraf.Metric, n)
+	for i := range a {
+		a[i] = getTagMetric("freya")
+	}
+	b := make([]telegraf.Metric, n)
+	for i := range b {
+		b[i] = getTagMetric("odin")
+	}
+
+	return append(a, b...)
+}
+
 func TestInvalidMethod(t *testing.T) {
 	plugin := &HTTP{
 		URL:    "",
@@ -324,6 +352,125 @@ func TestContentType(t *testing.T) {
 
 			err = tt.plugin.Write([]telegraf.Metric{getMetric()})
 			require.NoError(t, err)
+		})
+	}
+}
+
+func TestTagHeader(t *testing.T) {
+	ts := httptest.NewServer(http.NotFoundHandler())
+	defer ts.Close()
+
+	u, err := url.Parse(fmt.Sprintf("http://%s", ts.Listener.Addr().String()))
+	require.NoError(t, err)
+
+	tests := []struct {
+		name     string
+		metric   telegraf.Metric
+		plugin   *HTTP
+		expected string
+	}{
+		{
+			name:   "no header without tag",
+			metric: getMetric(),
+			plugin: &HTTP{
+				URL:        u.String(),
+				TagHeaders: map[string]string{"tag": "X-Tag-Header"},
+			},
+			expected: "",
+		},
+		{
+			name:   "header from tag",
+			metric: getTagMetric("freya"),
+			plugin: &HTTP{
+				URL:        u.String(),
+				TagHeaders: map[string]string{"tag": "X-Tag-Header"},
+			},
+			expected: "freya",
+		},
+		{
+			name:   "static header without tag",
+			metric: getMetric(),
+			plugin: &HTTP{
+				URL:        u.String(),
+				Headers:    map[string]string{"X-Tag-Header": "default"},
+				TagHeaders: map[string]string{"tag": "X-Tag-Header"},
+			},
+			expected: "default",
+		},
+		{
+			name:   "tag header overrides static header",
+			metric: getTagMetric("odin"),
+			plugin: &HTTP{
+				URL:        u.String(),
+				Headers:    map[string]string{"X-Tag-Header": "default"},
+				TagHeaders: map[string]string{"tag": "X-Tag-Header"},
+			},
+			expected: "odin",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				require.Equal(t, tt.expected, r.Header.Get("X-Tag-Header"))
+				w.WriteHeader(http.StatusOK)
+			})
+
+			serializer := influx.NewSerializer()
+			tt.plugin.SetSerializer(serializer)
+			err = tt.plugin.Connect()
+			require.NoError(t, err)
+
+			err = tt.plugin.Write([]telegraf.Metric{tt.metric})
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestBatchedTagHeaders(t *testing.T) {
+	ts := httptest.NewServer(http.NotFoundHandler())
+	defer ts.Close()
+
+	u, err := url.Parse(fmt.Sprintf("http://%s", ts.Listener.Addr().String()))
+	require.NoError(t, err)
+
+	client := &HTTP{
+		URL:        u.String(),
+		Method:     defaultMethod,
+		TagHeaders: map[string]string{"tag": "X-Tag-Header"},
+	}
+
+	jsonSerializer, err := json.NewSerializer(time.Second, "", "")
+	require.NoError(t, err)
+	s := map[string]serializers.Serializer{
+		"influx": influx.NewSerializer(),
+		"json":   jsonSerializer,
+	}
+
+	for name, serializer := range s {
+		var requests int
+		ts.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			w.WriteHeader(http.StatusOK)
+		})
+
+		t.Run(name, func(t *testing.T) {
+			for _, mode := range [...]bool{true} {
+				requests = 0
+				client.UseBatchFormat = mode
+				client.SetSerializer(serializer)
+
+				err = client.Connect()
+				require.NoError(t, err)
+				err = client.Write(getTagMetrics(3))
+				require.NoError(t, err)
+
+				if client.UseBatchFormat {
+					require.Equal(t, 2, requests, "batched")
+				} else {
+					require.Equal(t, 6, requests, "unbatched")
+				}
+			}
 		})
 	}
 }

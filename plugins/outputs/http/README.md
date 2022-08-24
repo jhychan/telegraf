@@ -68,6 +68,14 @@ format by default.
   #   # Should be set manually to "application/json" for json data_format
   #   Content-Type = "text/plain; charset=utf-8"
 
+  ## Optional setting to map tags into http headers.
+  ## If the specified tag is not present in the metric, it will not have a header.
+  ## If both a static http header and a tag-based http header exists, the tag header
+  ## will be used. The tag is removed from the metric.
+  # [outputs.http.tag_headers]
+  #   "TAG_NAME" = "HTTP_HEADER"
+  #   "__tenant_id__" = "X-Scope-OrgId"
+
   ## MaxIdleConns controls the maximum number of idle (keep-alive)
   ## connections across all hosts. Zero means no limit.
   # max_idle_conn = 0

@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	_ "embed"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"strings"
@@ -27,6 +28,7 @@ import (
 )
 
 // DO NOT REMOVE THE NEXT TWO LINES! This is required to embed the sampleConfig data.
+//
 //go:embed sample.conf
 var sampleConfig string
 
@@ -47,6 +49,7 @@ type HTTP struct {
 	Username                string            `toml:"username"`
 	Password                string            `toml:"password"`
 	Headers                 map[string]string `toml:"headers"`
+	TagHeaders              map[string]string `toml:"tag_headers"`
 	ContentEncoding         string            `toml:"content_encoding"`
 	UseBatchFormat          bool              `toml:"use_batch_format"`
 	AwsService              string            `toml:"aws_service"`
@@ -64,6 +67,8 @@ type HTTP struct {
 	CredentialsFile string `toml:"google_application_credentials"`
 	oauth2Token     *oauth2.Token
 }
+
+type Headers map[string]string
 
 func (*HTTP) SampleConfig() string {
 	return sampleConfig
@@ -106,32 +111,76 @@ func (h *HTTP) Close() error {
 
 func (h *HTTP) Write(metrics []telegraf.Metric) error {
 	var reqBody []byte
+	var headers = Headers{}
 
 	if h.UseBatchFormat {
-		var err error
-		reqBody, err = h.serializer.SerializeBatch(metrics)
-		if err != nil {
-			return err
-		}
+		if len(h.TagHeaders) > 0 {
+			headersmap := make(map[uint64]Headers)
+			metricsmap := make(map[uint64][]telegraf.Metric)
 
-		return h.writeMetric(reqBody)
+			for _, metric := range metrics {
+				fmt.Println(metric)
+				id := HashIDFromTagHeaders(metric, h.TagHeaders)
+
+				if _, ok := headersmap[id]; !ok {
+					headersmap[id] = h.createHeaders(metric)
+				}
+
+				for t := range h.TagHeaders {
+					metric.RemoveTag(t)
+				}
+
+				metricsmap[id] = append(metricsmap[id], metric)
+			}
+
+			for id, headers := range headersmap {
+				var err error
+
+				reqBody, err = h.serializer.SerializeBatch(metricsmap[id])
+				if err != nil {
+					return err
+				}
+
+				if err := h.writeMetric(reqBody, headers); err != nil {
+					return err
+				}
+			}
+
+			return nil
+
+		} else {
+			var err error
+
+			reqBody, err = h.serializer.SerializeBatch(metrics)
+			if err != nil {
+				return err
+			}
+
+			return h.writeMetric(reqBody, h.Headers)
+		}
 	}
 
 	for _, metric := range metrics {
 		var err error
+
+		headers = h.createHeaders(metric)
+		for t := range h.TagHeaders {
+			metric.RemoveTag(t)
+		}
+
 		reqBody, err = h.serializer.Serialize(metric)
 		if err != nil {
 			return err
 		}
 
-		if err := h.writeMetric(reqBody); err != nil {
+		if err := h.writeMetric(reqBody, headers); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (h *HTTP) writeMetric(reqBody []byte) error {
+func (h *HTTP) writeMetric(reqBody []byte, headers Headers) error {
 	var reqBodyBuffer io.Reader = bytes.NewBuffer(reqBody)
 
 	var err error
@@ -199,7 +248,7 @@ func (h *HTTP) writeMetric(reqBody []byte) error {
 	if h.ContentEncoding == "gzip" {
 		req.Header.Set("Content-Encoding", "gzip")
 	}
-	for k, v := range h.Headers {
+	for k, v := range headers {
 		if strings.ToLower(k) == "host" {
 			req.Host = v
 		}
@@ -265,4 +314,35 @@ func (h *HTTP) getAccessToken(ctx context.Context, audience string) (*oauth2.Tok
 	h.oauth2Token = token
 
 	return token, nil
+}
+
+func (h *HTTP) createHeaders(m telegraf.Metric) Headers {
+	var headers = Headers{}
+
+	for hdr, val := range h.Headers {
+		headers[hdr] = val
+	}
+
+	for tag, hdr := range h.TagHeaders {
+		val, ok := m.GetTag(tag)
+		if ok {
+			headers[hdr] = val
+		}
+	}
+
+	return headers
+}
+
+func HashIDFromTagHeaders(m telegraf.Metric, tagheaders map[string]string) uint64 {
+	h := fnv.New64a()
+	for tag, _ := range tagheaders {
+		val, ok := m.GetTag(tag)
+		if ok {
+			h.Write([]byte(tag))
+			h.Write([]byte("\n"))
+			h.Write([]byte(val))
+			h.Write([]byte("\n"))
+		}
+	}
+	return h.Sum64()
 }

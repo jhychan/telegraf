@@ -119,13 +119,15 @@ func (h *HTTP) Write(metrics []telegraf.Metric) error {
 			metricsmap := make(map[uint64][]telegraf.Metric)
 
 			for _, metric := range metrics {
-				fmt.Println(metric)
 				id := HashIDFromTagHeaders(metric, h.TagHeaders)
 
 				if _, ok := headersmap[id]; !ok {
 					headersmap[id] = h.createHeaders(metric)
 				}
 
+				// Avoid modifying the metric in case we need to retry the request.
+				metric = metric.Copy()
+				metric.Accept()
 				for t := range h.TagHeaders {
 					metric.RemoveTag(t)
 				}
@@ -164,6 +166,9 @@ func (h *HTTP) Write(metrics []telegraf.Metric) error {
 		var err error
 
 		headers = h.createHeaders(metric)
+		// Avoid modifying the metric in case we need to retry the request.
+		metric = metric.Copy()
+		metric.Accept()
 		for t := range h.TagHeaders {
 			metric.RemoveTag(t)
 		}
